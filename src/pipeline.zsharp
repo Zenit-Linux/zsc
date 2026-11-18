@@ -3,10 +3,12 @@ namespace pipeline;
 func stages() {
     return [
         ["name" => "lexer",             "status" => "done",    "impl" => "Workspace.lexer (Z#, parytet z Rust)"],
-        ["name" => "parser + AST",      "status" => "stage0",  "impl" => "zsc0 check (Rust); wersja Z# do napisania"],
-        ["name" => "semantic analysis", "status" => "todo",    "impl" => "-"],
+        ["name" => "parser + AST",      "status" => "done",    "impl" => "Workspace.parser (Z#, parytet z Rust: tests/parser_parity.sh)"],
+        ["name" => "semantic analysis", "status" => "done",    "impl" => "Workspace.sema (zmienne + analiza ucieczki -> klasy ZAMM)"],
+        ["name" => "zbc packer",        "status" => "done",    "impl" => "Workspace.zbc (.zbc = AST bez źródeł; zsc0 exec)"],
         ["name" => "Z# IR (SSA)",       "status" => "todo",    "impl" => "-"],
-        ["name" => "ZAMM lowering",     "status" => "todo",    "impl" => "-"],
+        ["name" => "ZAMM runtime",       "status" => "done",    "impl" => "Z-Sharp/zamm + Z-Sharp/runtime (libzs_runtime.a, ABI C)"],
+        ["name" => "ZAMM lowering",     "status" => "todo",    "impl" => "- (escape analysis -> zamm::Hint)"],
         ["name" => "LLVM backend",      "status" => "todo",    "impl" => "-"],
         ["name" => "linker + runtime",  "status" => "todo",    "impl" => "-"],
         ["name" => "extern linking",    "status" => "todo",    "impl" => "składnia sparsowana w stage0; linkowanie w zsc"]

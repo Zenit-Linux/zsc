@@ -2,15 +2,16 @@ namespace pipeline;
 
 func stages() {
     return [
-        ["name" => "lexer",             "status" => "done",    "impl" => "Workspace.lexer (Z#, parytet z Rust)"],
-        ["name" => "parser + AST",      "status" => "done",    "impl" => "Workspace.parser (Z#, parytet z Rust: tests/parser_parity.sh)"],
-        ["name" => "semantic analysis", "status" => "done",    "impl" => "Workspace.sema (zmienne + analiza ucieczki -> klasy ZAMM)"],
-        ["name" => "zbc packer",        "status" => "done",    "impl" => "Workspace.zbc (.zbc = AST bez źródeł; zsc0 exec)"],
-        ["name" => "Z# IR (SSA)",       "status" => "todo",    "impl" => "-"],
-        ["name" => "ZAMM runtime",       "status" => "done",    "impl" => "Z-Sharp/zamm + Z-Sharp/runtime (libzs_runtime.a, ABI C)"],
-        ["name" => "ZAMM lowering",     "status" => "todo",    "impl" => "- (escape analysis -> zamm::Hint)"],
-        ["name" => "LLVM backend",      "status" => "todo",    "impl" => "-"],
-        ["name" => "linker + runtime",  "status" => "todo",    "impl" => "-"],
-        ["name" => "extern linking",    "status" => "todo",    "impl" => "składnia sparsowana w stage0; linkowanie w zsc"]
+        ["name" => "lexer",             "status" => "done", "impl" => "Workspace.lexer (Z#, parytet z Rust)"],
+        ["name" => "parser + AST",      "status" => "done", "impl" => "Workspace.parser (Z#, parytet z Rust: tests/parser_parity.sh)"],
+        ["name" => "semantic analysis", "status" => "done", "impl" => "Workspace.sema (zmienne + analiza ucieczki -> klasy ZAMM)"],
+        ["name" => "zbc packer",        "status" => "done", "impl" => "Workspace.zbc (.zbc = AST bez źródeł; zsc0 exec / zsi)"],
+        ["name" => "Z# IR",             "status" => "done", "impl" => "Workspace.ir (strukturalne IR, walidacja, lokalne; SSA: todo)"],
+        ["name" => "ZAMM runtime",      "status" => "done", "impl" => "Z-Sharp/zamm + Z-Sharp/runtime (Z# = definicja; libzs_runtime.a = wykonanie natywne)"],
+        ["name" => "ZAMM lowering",     "status" => "todo", "impl" => "- (wyniki analizy ucieczki -> ramki; natywnie: czas życia Persistent)"],
+        ["name" => "C backend",         "status" => "done", "impl" => "Workspace.emit_c (podzbiór: funkcje, tablice indeksowane, napisy, pętle, switch)"],
+        ["name" => "linker + runtime",  "status" => "done", "impl" => "cc + libzs_runtime.a (statycznie)"],
+        ["name" => "LLVM backend",      "status" => "todo", "impl" => "-"],
+        ["name" => "extern linking",    "status" => "todo", "impl" => "składnia sparsowana w stage0; linkowanie w zsc"]
     ];
 }

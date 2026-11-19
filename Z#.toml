@@ -3,7 +3,7 @@ name = "zsc"
 version = "0.0.1"
 kind = "bin"
 entry = "src/main.zsharp"
-description = "Kompilator AOT Z# (frontend + przyszły backend LLVM)"
+description = "Kompilator AOT Z# (frontend, IR, backend LLVM -> binarka natywna)"
 license = "Apache-2.0"
 
 [dependencies]

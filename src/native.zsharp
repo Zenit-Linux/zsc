@@ -1,0 +1,129 @@
+namespace native;
+
+import Workspace.parser;
+import Workspace.sema;
+import Workspace.ir;
+import Workspace.emit_c;
+
+##
+ * Sterownik natywnego backendu zsc: źródło -> AST -> sema -> IR -> C -> (cc + libzs_runtime.a) -> binarka.
+##
+
+func basename($p) {
+    $i = strlen($p) - 1;
+    while ($i >= 0 && substr($p, $i, 1) !== "/") { $i--; }
+    return substr($p, $i + 1);
+}
+
+func stem($p) {
+    $b = basename($p);
+    $dot = -1;
+    for ($i = 0; $i < strlen($b); $i++) { if (substr($b, $i, 1) === ".") { $dot = $i; } }
+    return $dot > 0 ? substr($b, 0, $dot) : $b;
+}
+
+##
+ * Katalog główny Z-Sharp (runtime/include + target/release/libzs_runtime.a).
+ * Kolejność: $ZS_HOME, potem rozwiązanie `Workspace` względem skryptu zsc.
+##
+func zs_root($scriptDir) {
+    $env = System.env("ZS_HOME");
+    if ($env !== null && $env !== "") { return $env; }
+    $f = System.resolveImport(["Workspace", "cli"], $scriptDir);
+    if ($f === null) { return null; }
+    return System.dirname(System.dirname($f));
+}
+
+func runtime_lib($root) {
+    $env = System.env("ZS_RUNTIME_LIB");
+    if ($env !== null && $env !== "") { return $env; }
+    foreach (["target/release/libzs_runtime.a", "target/debug/libzs_runtime.a", "lib/libzs_runtime.a"] as $rel) {
+        if (File.exists($root . "/" . $rel)) { return $root . "/" . $rel; }
+    }
+    return null;
+}
+
+##
+ * Frontend wspólny dla wszystkich poleceń. Zwraca ["ast" => ..., "warnings" => ...] albo rzuca Exception
+ * z gotowym komunikatem `plik:linia:kolumna: błąd: ...`.
+##
+func frontend($file) {
+    if (!File.exists($file)) { throw new Exception("zsc: nie znaleziono pliku " . $file); }
+    try { $ast = parser.parse(File.read($file)); }
+    catch (Exception $e) {
+        # komunikaty parsera/lexera zaczynają się od `linia:kolumna:`
+        throw new Exception($file . ":" . $e->getMessage());
+    }
+    $r = sema.analyze($ast);
+    return ["ast" => $ast, "warnings" => $r["warnings"]];
+}
+
+func print_warnings($file, $warnings) {
+    foreach ($warnings as $w) { eecho($file . ":" . $w[0] . ": ostrzeżenie: " . $w[1]); }
+}
+
+##
+ * Lowering do IR; błędy backendu natywnego wypisuje w formacie `plik:linia: błąd [Exxxx]: ...`.
+ * Zwraca IR albo null, jeśli były błędy.
+##
+func lower_or_report($file, $ast) {
+    $res = ir.lower($ast);
+    if (count($res["errors"]) === 0) { return $res; }
+    foreach ($res["errors"] as $e) { eecho($file . ":" . $e[0] . ": błąd [" . $e[1] . "]: " . $e[2]); }
+    eecho("zsc: " . count($res["errors"]) . " błędów — pełny język działa przez `zsc build --emit zbc` (uruchamianie: zsi)");
+    return null;
+}
+
+func find_cc($opts) {
+    $cands = [];
+    if (($opts["options"]["cc"] ?? null) !== null) { $cands[] = $opts["options"]["cc"]; }
+    $env = System.env("ZS_CC");
+    if ($env !== null && $env !== "") { $cands[] = $env; }
+    foreach (["cc", "gcc", "clang"] as $c) { $cands[] = $c; }
+    foreach ($cands as $c) {
+        try { $r = Process.run($c, ["--version"]); if ($r["status"] === 0) { return $c; } }
+        catch (Exception $e) { }
+    }
+    return null;
+}
+
+func opt_level($opts) {
+    foreach (["-O0", "-O1", "-O2", "-O3", "-Os"] as $o) { if (has_key($opts["flags"], $o)) { return $o; } }
+    return "-O2";
+}
+
+##
+ * Buduje binarkę natywną. Zwraca 0 albo kod błędu (komunikaty na stderr).
+##
+func build_exe($file, $out, $opts, $scriptDir, $keepC) {
+    try { $fe = frontend($file); }
+    catch (Exception $e) { eecho($e->getMessage()); return 1; }
+    print_warnings($file, $fe["warnings"]);
+    $irr = lower_or_report($file, $fe["ast"]);
+    if ($irr === null) { return 1; }
+    $root = zs_root($scriptDir);
+    if ($root === null || !File.exists($root . "/runtime/include/zs_native.h")) {
+        eecho("zsc: nie znaleziono Z-Sharp (runtime/include/zs_native.h) — ustaw ZS_HOME");
+        return 1;
+    }
+    $lib = runtime_lib($root);
+    if ($lib === null) {
+        eecho("zsc: brak libzs_runtime.a — zbuduj rdzeń: (cd " . $root . " && cargo build --release) albo ustaw ZS_RUNTIME_LIB");
+        return 1;
+    }
+    $cc = find_cc($opts);
+    if ($cc === null) { eecho("zsc: nie znaleziono kompilatora C (cc/gcc/clang) — zainstaluj lub ustaw ZS_CC / --cc"); return 1; }
+    try { $csrc = emit_c.generate($irr); }
+    catch (Exception $e) { eecho("zsc: błąd wewnętrzny backendu: " . $e->getMessage()); return 1; }
+    $cfile = $out . ".c";
+    File.write($cfile, $csrc);
+    $args = [$cfile, "-o", $out, opt_level($opts), "-std=gnu11", "-w", "-I", $root . "/runtime/include", $lib, "-lm", "-lpthread", "-ldl"];
+    $r = Process.run($cc, $args);
+    if (!$keepC && $r["status"] === 0) { File.delete($cfile); }
+    if ($r["status"] !== 0) {
+        eecho($r["stderr"]);
+        eecho("zsc: błąd wewnętrzny: wygenerowany kod C nie kompiluje się (zachowano " . $cfile . ")");
+        return 1;
+    }
+    return 0;
+}

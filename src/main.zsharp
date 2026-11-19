@@ -2,73 +2,122 @@ import Workspace.lexer;
 import Workspace.parser;
 import Workspace.zbc;
 import Workspace.sema;
+import Workspace.ir;
 import Workspace.cli;
 import pipeline;
+import native;
 
 func usage(): void {
-    println("użycie:");
-    println("  zsc check [--strict] <plik.zs>      składnia + analiza semantyczna (--strict: ostrzeżenia = błąd)");
-    println("  zsc build <plik.zs> [-o <plik.zbc>] [--emit zbc]   (domyślnie: pakiet .zbc uruchamiany przez zsi)\n  zsc build ... --target <triple> [-O0..-O3|-Os]   (LLVM: jeszcze niedostępne)");
-    println("  zsc analyze <plik.zs>               analiza ucieczki: klasy pamięci ZAMM dla alokacji");
-    println("  zsc --tokens <plik.zs>              zrzut tokenów");
-    println("  zsc stages                          stan etapów kompilatora");
+    echo "zsc — kompilator Z# 0.0.1";
+    echo "użycie:";
+    echo "  zsc build <plik.zs> [-o <wyjście>] [--emit exe|c|ir|zbc] [-O0..-O3|-Os] [--cc <cc>] [--keep-c]";
+    echo "      domyślnie: binarka natywna (C + cc + libzs_runtime.a); --target: tylko `host` (LLVM: todo)";
+    echo "  zsc run <plik.zs> [-- argumenty...]   zbuduj i uruchom";
+    echo "  zsc check [--strict] [--native] <plik.zs>   składnia + sema (--native: zgodność z backendem natywnym)";
+    echo "  zsc analyze <plik.zs>                analiza ucieczki: klasy pamięci ZAMM dla alokacji";
+    echo "  zsc --tokens <plik.zs>               zrzut tokenów";
+    echo "  zsc stages                           stan etapów kompilatora";
+    echo "  zsc --version | --help";
+    echo "kody wyjścia: 0 ok, 1 błąd, 2 użycie, 3 funkcja niedostępna";
+    echo "zmienne: ZS_HOME (katalog Z-Sharp), ZS_RUNTIME_LIB, ZS_CC";
 }
 
-func check(string $file, bool $strict = false): int {
-    if (!File.exists($file)) { eprintln("zsc: nie znaleziono pliku " . $file); return 1; }
-    # frontend stage1: lekser, parser i analiza semantyczna napisane w Z#
-    try { $ast = parser.parse(File.read($file)); }
-    catch (Exception $e) { eprintln($file . ": " . $e->getMessage()); return 1; }
-    $r = sema.analyze($ast);
-    foreach ($r["warnings"] as $w) { eprintln($file . ":" . $w[0] . ": ostrzeżenie: " . $w[1]); }
-    if ($strict && count($r["warnings"]) > 0) { return 1; }
+func check(string $file, bool $strict = false, bool $nativeMode = false): int {
+    try { $fe = native.frontend($file); }
+    catch (Exception $e) { eecho($e->getMessage()); return 1; }
+    native.print_warnings($file, $fe["warnings"]);
+    if ($strict && count($fe["warnings"]) > 0) { return 1; }
+    if ($nativeMode && native.lower_or_report($file, $fe["ast"]) === null) { return 1; }
     return 0;
 }
 
 func analyze(string $file): int {
-    if (!File.exists($file)) { eprintln("zsc: nie znaleziono pliku " . $file); return 1; }
-    try { $ast = parser.parse(File.read($file)); }
-    catch (Exception $e) { eprintln($file . ": " . $e->getMessage()); return 1; }
-    println(sema.report(sema.analyze($ast)));
+    try { $fe = native.frontend($file); }
+    catch (Exception $e) { eecho($e->getMessage()); return 1; }
+    echo sema.report(sema.analyze($fe["ast"]));
     return 0;
 }
 
-func build(string $file, $opts): int {
+func build_zbc(string $file, string $out): int {
     if (check($file) !== 0) { return 1; }
-    $emit = $opts["options"]["emit"] ?? "zbc";
-    $target = $opts["options"]["target"] ?? "host";
-    if ($emit !== "zbc" || $target !== "host") {
-        eprintln("zsc: backend natywny (LLVM, cel: " . $target . ", emit: " . $emit . ") nie jest jeszcze zaimplementowany — zob. `zsc stages`");
-        eprintln("zsc: dostępne: --emit zbc (domyślnie), uruchamiane przez `zsi`");
+    try { $data = zbc.bundle($file); }
+    catch (Exception $e) { eecho("zsc: " . $e->getMessage()); return 1; }
+    File.write($out, $data);
+    echo "zsc: " . $out . " (" . strlen($data) . " B)";
+    return 0;
+}
+
+func build(string $file, $opts, $scriptDir): int {
+    $o = $opts["options"];
+    $emit = $o["emit"] ?? "exe";
+    $target = $o["target"] ?? "host";
+    if ($target !== "host") {
+        eecho("zsc: cel `" . $target . "` wymaga backendu LLVM (jeszcze niedostępny) — dostępne: --target host");
         return 3;
     }
-    $out = $opts["options"]["o"] ?? ($file . ".zbc");
-    try { $data = zbc.bundle($file); }
-    catch (Exception $e) { eprintln("zsc: " . $e->getMessage()); return 1; }
-    File.write($out, $data);
-    println("zsc: " . $out . " (" . strlen($data) . " B)");
-    return 0;
+    if (!in_array($emit, ["exe", "c", "ir", "zbc"])) { eecho("zsc: nieznany --emit " . $emit . " (exe|c|ir|zbc)"); return 2; }
+    $stem = native.stem($file);
+    if ($emit === "zbc") { return build_zbc($file, $o["o"] ?? ($stem . ".zbc")); }
+    if ($emit === "ir") {
+        try { $fe = native.frontend($file); }
+        catch (Exception $e) { eecho($e->getMessage()); return 1; }
+        $res = ir.lower($fe["ast"]);
+        echo ir.report($res);
+        foreach ($res["errors"] as $e) { eecho($file . ":" . $e[0] . ": błąd [" . $e[1] . "]: " . $e[2]); }
+        return count($res["errors"]) > 0 ? 1 : 0;
+    }
+    $out = $o["o"] ?? $stem;
+    if ($emit === "c") {
+        try { $fe = native.frontend($file); }
+        catch (Exception $e) { eecho($e->getMessage()); return 1; }
+        $res = native.lower_or_report($file, $fe["ast"]);
+        if ($res === null) { return 1; }
+        $cpath = has_key($o, "o") ? $out : $stem . ".c";
+        File.write($cpath, emit_c.generate($res));
+        echo "zsc: " . $cpath;
+        return 0;
+    }
+    $rc = native.build_exe($file, $out, $opts, $scriptDir, has_key($opts["flags"], "--keep-c"));
+    if ($rc === 0) { echo "zsc: " . $out; }
+    return $rc;
+}
+
+func run(string $file, $opts, $extra, $scriptDir): int {
+    $dir = System.env("TMPDIR") ?? "/tmp";
+    $tmp = $dir . "/zsc-run-" . intval(System.time() * 1000);
+    Directory.create($tmp);
+    $exe = $tmp . "/" . native.stem($file);
+    $rc = native.build_exe($file, $exe, $opts, $scriptDir, false);
+    if ($rc !== 0) { return $rc; }
+    $status = Process.exec($exe, $extra);
+    File.delete($exe);
+    return $status;
 }
 
 func main(): int {
-    $r = cli.parse(System.args(), ["o", "target", "emit"]);
+    $argv = System.args();
+    $scriptDir = System.dirname($argv[0]);
+    $r = cli.parse($argv, ["o", "target", "emit", "cc"]);
     $pos = $r["positional"];
     $flags = $r["flags"];
+    if (has_key($flags, "--version")) { echo "zsc " . System.version; return 0; }
+    if (has_key($flags, "--help") || has_key($flags, "-h")) { usage(); return 0; }
     if (has_key($flags, "--tokens") && count($pos) === 1) {
-        foreach (lexer.tokenize(File.read($pos[0])) as $t) { println($t["line"] . ":" . $t["col"] . "\t" . $t["kind"] . "\t" . $t["text"]); }
+        foreach (lexer.tokenize(File.read($pos[0])) as $t) { echo $t["line"] . ":" . $t["col"] . "\t" . $t["kind"] . "\t" . $t["text"]; }
         return 0;
     }
     if (count($pos) === 0) { usage(); return 2; }
     $cmd = $pos[0];
     if ($cmd === "stages") {
-        foreach (pipeline.stages() as $s) { println(pad_right($s["name"], 20) . pad_right($s["status"], 8) . $s["impl"]); }
+        foreach (pipeline.stages() as $s) { echo pad_right($s["name"], 20) . pad_right($s["status"], 8) . $s["impl"]; }
         return 0;
     }
     if (count($pos) < 2) { usage(); return 2; }
-    if ($cmd === "check") { return check($pos[1], has_key($flags, "--strict")); }
+    if ($cmd === "check") { return check($pos[1], has_key($flags, "--strict"), has_key($flags, "--native")); }
     if ($cmd === "analyze") { return analyze($pos[1]); }
-    if ($cmd === "build") { return build($pos[1], $r); }
-    eprintln("zsc: nieznane polecenie " . $cmd);
+    if ($cmd === "build") { return build($pos[1], $r, $scriptDir); }
+    if ($cmd === "run") { return run($pos[1], $r, array_slice($pos, 2, count($pos) - 2), $scriptDir); }
+    eecho("zsc: nieznane polecenie " . $cmd);
     usage();
     return 2;
 }

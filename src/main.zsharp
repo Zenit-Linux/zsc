@@ -6,12 +6,14 @@ import Workspace.ir;
 import Workspace.cli;
 import pipeline;
 import native;
+import Workspace.emit_c;
+import Workspace.emit_llvm;
 
 func usage(): void {
     echo "zsc — kompilator Z# 0.0.1";
     echo "użycie:";
-    echo "  zsc build <plik.zs> [-o <wyjście>] [--emit exe|c|ir|zbc] [-O0..-O3|-Os] [--cc <cc>] [--keep-c]";
-    echo "      domyślnie: binarka natywna (C + cc + libzs_runtime.a); --target: tylko `host` (LLVM: todo)";
+    echo "  zsc build <plik.zs> [-o <wyjście>] [--emit exe|c|ll|ir|zbc] [--backend c|llvm] [-O0..-O3|-Os] [--cc <cc>] [--keep-c]";
+    echo "      domyślnie: binarka natywna (backend C + cc + runtime/native/zs_rt.c); --backend llvm: LLVM IR + clang; --emit ll: tylko .ll";
     echo "  zsc run <plik.zs> [-- argumenty...]   zbuduj i uruchom";
     echo "  zsc check [--strict] [--native] <plik.zs>   składnia + sema (--native: zgodność z backendem natywnym)";
     echo "  zsc analyze <plik.zs>                analiza ucieczki: klasy pamięci ZAMM dla alokacji";
@@ -23,7 +25,7 @@ func usage(): void {
 }
 
 func check(string $file, bool $strict = false, bool $nativeMode = false): int {
-    try { $fe = native.frontend($file); }
+    try { $fe = native.frontend($file, $nativeMode); }
     catch (Exception $e) { eecho($e->getMessage()); return 1; }
     native.print_warnings($file, $fe["warnings"]);
     if ($strict && count($fe["warnings"]) > 0) { return 1; }
@@ -51,15 +53,17 @@ func build(string $file, $opts, $scriptDir): int {
     $o = $opts["options"];
     $emit = $o["emit"] ?? "exe";
     $target = $o["target"] ?? "host";
-    if ($target !== "host") {
-        eecho("zsc: cel `" . $target . "` wymaga backendu LLVM (jeszcze niedostępny) — dostępne: --target host");
+    if ($target !== "host" && ($o["backend"] ?? "c") !== "llvm") {
+        eecho("zsc: --target " . $target . " wymaga --backend llvm (backend C: użyj --cc <cross-gcc>)");
         return 3;
     }
-    if (!in_array($emit, ["exe", "c", "ir", "zbc"])) { eecho("zsc: nieznany --emit " . $emit . " (exe|c|ir|zbc)"); return 2; }
+    if (!in_array($emit, ["exe", "c", "ll", "ir", "zbc"])) { eecho("zsc: nieznany --emit " . $emit . " (exe|c|ll|ir|zbc)"); return 2; }
+    $bk = $o["backend"] ?? "c";
+    if (!in_array($bk, ["c", "llvm"])) { eecho("zsc: nieznany --backend " . $bk . " (c|llvm)"); return 2; }
     $stem = native.stem($file);
     if ($emit === "zbc") { return build_zbc($file, $o["o"] ?? ($stem . ".zbc")); }
     if ($emit === "ir") {
-        try { $fe = native.frontend($file); }
+        try { $fe = native.frontend($file, true); }
         catch (Exception $e) { eecho($e->getMessage()); return 1; }
         $res = ir.lower($fe["ast"]);
         echo ir.report($res);
@@ -68,13 +72,23 @@ func build(string $file, $opts, $scriptDir): int {
     }
     $out = $o["o"] ?? $stem;
     if ($emit === "c") {
-        try { $fe = native.frontend($file); }
+        try { $fe = native.frontend($file, true); }
         catch (Exception $e) { eecho($e->getMessage()); return 1; }
         $res = native.lower_or_report($file, $fe["ast"]);
         if ($res === null) { return 1; }
         $cpath = has_key($o, "o") ? $out : $stem . ".c";
         File.write($cpath, emit_c.generate($res));
         echo "zsc: " . $cpath;
+        return 0;
+    }
+    if ($emit === "ll") {
+        try { $fe = native.frontend($file, true); }
+        catch (Exception $e) { eecho($e->getMessage()); return 1; }
+        $res = native.lower_or_report($file, $fe["ast"]);
+        if ($res === null) { return 1; }
+        $lpath = has_key($o, "o") ? $out : $stem . ".ll";
+        File.write($lpath, emit_llvm.generate($res, $target === "host" ? "x86_64-pc-linux-gnu" : $target));
+        echo "zsc: " . $lpath;
         return 0;
     }
     $rc = native.build_exe($file, $out, $opts, $scriptDir, has_key($opts["flags"], "--keep-c"));
@@ -97,7 +111,7 @@ func run(string $file, $opts, $extra, $scriptDir): int {
 func main(): int {
     $argv = System.args();
     $scriptDir = System.dirname($argv[0]);
-    $r = cli.parse($argv, ["o", "target", "emit", "cc"]);
+    $r = cli.parse($argv, ["o", "target", "emit", "cc", "backend"]);
     $pos = $r["positional"];
     $flags = $r["flags"];
     if (has_key($flags, "--version")) { echo "zsc " . System.version; return 0; }

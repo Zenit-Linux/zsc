@@ -7,11 +7,12 @@ func stages() {
         ["name" => "semantic analysis", "status" => "done", "impl" => "Workspace.sema (zmienne + analiza ucieczki -> klasy ZAMM)"],
         ["name" => "zbc packer",        "status" => "done", "impl" => "Workspace.zbc (.zbc = AST bez źródeł; zsc0 exec / zsi)"],
         ["name" => "Z# IR",             "status" => "done", "impl" => "Workspace.ir (strukturalne IR, walidacja, lokalne; SSA: todo)"],
-        ["name" => "ZAMM runtime",      "status" => "done", "impl" => "Z-Sharp/zamm + Z-Sharp/runtime (Z# = definicja; libzs_runtime.a = wykonanie natywne)"],
+        ["name" => "ZAMM runtime",      "status" => "done", "impl" => "Z-Sharp/zamm + runtime (Z# = definicja); natywnie: runtime/native/zs_rt.c (C, bez Rusta)"],
         ["name" => "ZAMM lowering",     "status" => "todo", "impl" => "- (wyniki analizy ucieczki -> ramki; natywnie: czas życia Persistent)"],
         ["name" => "C backend",         "status" => "done", "impl" => "Workspace.emit_c (podzbiór: funkcje, tablice indeksowane, napisy, pętle, switch)"],
-        ["name" => "linker + runtime",  "status" => "done", "impl" => "cc + libzs_runtime.a (statycznie)"],
-        ["name" => "LLVM backend",      "status" => "todo", "impl" => "-"],
+        ["name" => "linker + runtime",  "status" => "done", "impl" => "cc/clang + runtime/native/zs_rt.c"],
+        ["name" => "LLVM backend",      "status" => "done", "impl" => "Workspace.emit_llvm (podzbiór natywny; .ll + clang; --target <triple>)"],
+        ["name" => "native classes", "status" => "todo", "impl" => "klasy, domknięcia, importy w backendach natywnych (warunek samokompilacji natywnej)"],
         ["name" => "extern linking",    "status" => "todo", "impl" => "składnia sparsowana w stage0; linkowanie w zsc"]
     ];
 }

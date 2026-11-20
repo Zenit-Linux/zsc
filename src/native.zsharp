@@ -3,7 +3,9 @@ namespace native;
 import Workspace.parser;
 import Workspace.sema;
 import Workspace.ir;
+import Workspace.link;
 import Workspace.emit_c;
+import Workspace.emit_llvm;
 
 ##
  * Sterownik natywnego backendu zsc: źródło -> AST -> sema -> IR -> C -> (cc + libzs_runtime.a) -> binarka.
@@ -47,7 +49,7 @@ func runtime_lib($root) {
  * Frontend wspólny dla wszystkich poleceń. Zwraca ["ast" => ..., "warnings" => ...] albo rzuca Exception
  * z gotowym komunikatem `plik:linia:kolumna: błąd: ...`.
 ##
-func frontend($file) {
+func frontend($file, $doLink = false) {
     if (!File.exists($file)) { throw new Exception("zsc: nie znaleziono pliku " . $file); }
     try { $ast = parser.parse(File.read($file)); }
     catch (Exception $e) {
@@ -55,7 +57,13 @@ func frontend($file) {
         throw new Exception($file . ":" . $e->getMessage());
     }
     $r = sema.analyze($ast);
-    return ["ast" => $ast, "warnings" => $r["warnings"]];
+    if (!$doLink) { return ["ast" => $ast, "warnings" => $r["warnings"]]; }
+    $lk = link.link($ast, $file);
+    if (count($lk["errors"]) > 0) {
+        foreach ($lk["errors"] as $e) { eecho($e[3] . ":" . $e[0] . ": błąd [" . $e[1] . "]: " . $e[2]); }
+        throw new Exception("zsc: " . count($lk["errors"]) . " błędów linkowania modułów");
+    }
+    return ["ast" => $lk["ast"], "warnings" => $r["warnings"]];
 }
 
 func print_warnings($file, $warnings) {
@@ -87,6 +95,18 @@ func find_cc($opts) {
     return null;
 }
 
+func find_llvm_cc($opts) {
+    $c = $opts["options"]["cc"] ?? System.env("ZS_CC");
+    $cands = [];
+    if ($c !== null && $c !== "") { $cands[] = $c; }
+    foreach (["clang", "clang-18", "clang-17", "clang-16", "clang-19", "clang-20"] as $x) { $cands[] = $x; }
+    foreach ($cands as $x) {
+        try { $r = Process.run($x, ["--version"]); if ($r["status"] === 0 && contains($r["stdout"], "clang")) { return $x; } }
+        catch (Exception $e) { }
+    }
+    return null;
+}
+
 func opt_level($opts) {
     foreach (["-O0", "-O1", "-O2", "-O3", "-Os"] as $o) { if (has_key($opts["flags"], $o)) { return $o; } }
     return "-O2";
@@ -96,7 +116,7 @@ func opt_level($opts) {
  * Buduje binarkę natywną. Zwraca 0 albo kod błędu (komunikaty na stderr).
 ##
 func build_exe($file, $out, $opts, $scriptDir, $keepC) {
-    try { $fe = frontend($file); }
+    try { $fe = frontend($file, true); }
     catch (Exception $e) { eecho($e->getMessage()); return 1; }
     print_warnings($file, $fe["warnings"]);
     $irr = lower_or_report($file, $fe["ast"]);
@@ -106,18 +126,18 @@ func build_exe($file, $out, $opts, $scriptDir, $keepC) {
         eecho("zsc: nie znaleziono Z-Sharp (runtime/include/zs_native.h) — ustaw ZS_HOME");
         return 1;
     }
-    $lib = runtime_lib($root);
-    if ($lib === null) {
-        eecho("zsc: brak libzs_runtime.a — zbuduj rdzeń: (cd " . $root . " && cargo build --release) albo ustaw ZS_RUNTIME_LIB");
-        return 1;
-    }
+    $rt = $root . "/runtime/native/zs_rt.c";
+    if (!File.exists($rt)) { eecho("zsc: brak " . $rt . " — niekompletny Z-Sharp (ustaw ZS_HOME)"); return 1; }
     $cc = find_cc($opts);
     if ($cc === null) { eecho("zsc: nie znaleziono kompilatora C (cc/gcc/clang) — zainstaluj lub ustaw ZS_CC / --cc"); return 1; }
-    try { $csrc = emit_c.generate($irr); }
+    $backend = $opts["options"]["backend"] ?? "c";
+    try { $csrc = $backend === "llvm" ? emit_llvm.generate($irr, (($opts["options"]["target"] ?? "host") === "host" ? "x86_64-pc-linux-gnu" : $opts["options"]["target"])) : emit_c.generate($irr); }
     catch (Exception $e) { eecho("zsc: błąd wewnętrzny backendu: " . $e->getMessage()); return 1; }
-    $cfile = $out . ".c";
+    $cfile = $out . ($backend === "llvm" ? ".ll" : ".c");
     File.write($cfile, $csrc);
-    $args = [$cfile, "-o", $out, opt_level($opts), "-std=gnu11", "-w", "-I", $root . "/runtime/include", $lib, "-lm", "-lpthread", "-ldl"];
+    $args = [$cfile, "-o", $out, opt_level($opts), "-std=gnu11", "-w", "-I", $root . "/runtime/include", $rt, "-lm"];
+    if ($backend === "llvm" && has_key($opts["options"], "target") && $opts["options"]["target"] !== "host") { $args[] = "--target=" . $opts["options"]["target"]; }
+    if ($backend === "llvm") { $cc = find_llvm_cc($opts); if ($cc === null) { eecho("zsc: backend LLVM wymaga clang (zainstaluj lub ustaw ZS_CC / --cc)"); return 1; } }
     $r = Process.run($cc, $args);
     if (!$keepC && $r["status"] === 0) { File.delete($cfile); }
     if ($r["status"] !== 0) {

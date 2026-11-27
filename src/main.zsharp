@@ -5,23 +5,25 @@ import Workspace.sema;
 import Workspace.ir;
 import Workspace.cli;
 import pipeline;
+import llvmtool;
 import native;
-import Workspace.emit_c;
 import Workspace.emit_llvm;
 
 func usage(): void {
-    echo "zsc — kompilator Z# 0.0.1";
+    echo "zsc — kompilator Z# 0.0.1 (backend LLVM >= 21)";
     echo "użycie:";
-    echo "  zsc build <plik.zs> [-o <wyjście>] [--emit exe|c|ll|ir|zbc] [--backend c|llvm] [-O0..-O3|-Os] [--cc <cc>] [--keep-c]";
-    echo "      domyślnie: binarka natywna (backend C + cc + runtime/native/zs_rt.c); --backend llvm: LLVM IR + clang; --emit ll: tylko .ll";
-    echo "  zsc run <plik.zs> [-- argumenty...]   zbuduj i uruchom";
+    echo "  zsc build <plik.zs> [-o <wyjście>] [--emit exe|obj|asm|bc|ll|ir|zbc] [-O0|-O1|-O2|-O3|-Os|-Oz] [--target <triple>]";
+    echo "      Z# -> AST -> sema -> IR -> LLVM IR -> opt -> llc -> linker (+ runtime). Domyślnie: plik wykonywalny.";
+    echo "      -c = --emit obj, -S = --emit asm. --keep-temps zostawia pliki pośrednie.";
+    echo "  zsc run <plik.zs> [-- argumenty...]    zbuduj i uruchom (kod wyjścia programu = kod wyjścia zsc)";
     echo "  zsc check [--strict] [--native] <plik.zs>   składnia + sema (--native: zgodność z backendem natywnym)";
-    echo "  zsc analyze <plik.zs>                analiza ucieczki: klasy pamięci ZAMM dla alokacji";
-    echo "  zsc --tokens <plik.zs>               zrzut tokenów";
-    echo "  zsc stages                           stan etapów kompilatora";
-    echo "  zsc --version | --help";
-    echo "kody wyjścia: 0 ok, 1 błąd, 2 użycie, 3 funkcja niedostępna";
-    echo "zmienne: ZS_HOME (katalog Z-Sharp), ZS_RUNTIME_LIB, ZS_CC";
+    echo "  zsc analyze <plik.zs>                  analiza ucieczki: klasy pamięci ZAMM dla alokacji";
+    echo "  zsc runtime [-o <plik.o>]              zbuduj obiekt runtime (zs_rt.c) i wypisz ścieżkę";
+    echo "  zsc toolchain                          wykryte narzędzia LLVM i ich wersje";
+    echo "  zsc stages | --tokens <plik> | --version | --help";
+    echo "opcje toolchaina: --llvm-bin <katalog>  --linker <sterownik>  --runtime-obj <plik.o>  --ldflags \"...\"  --allow-older-llvm";
+    echo "kody wyjścia: 0 ok, 1 błąd (składnia, konstrukcja spoza podzbioru, błąd narzędzia), 2 użycie, 3 brak/za stary toolchain LLVM";
+    echo "zmienne: ZS_HOME, ZS_LLVM_BIN, ZS_LINKER, ZS_RUNTIME_OBJ, ZS_CACHE, ZS_ALLOW_OLD_LLVM";
 }
 
 func check(string $file, bool $strict = false, bool $nativeMode = false): int {
@@ -49,20 +51,33 @@ func build_zbc(string $file, string $out): int {
     return 0;
 }
 
+func emit_kind($o, $flags) {
+    $emit = $o["emit"] ?? null;
+    if ($emit === null && has_key($flags, "-c")) { $emit = "obj"; }
+    if ($emit === null && has_key($flags, "-S")) { $emit = "asm"; }
+    return $emit ?? "exe";
+}
+
+func default_out($stem, $kind) {
+    if ($kind === "ll") { return $stem . ".ll"; }
+    if ($kind === "bc") { return $stem . ".bc"; }
+    if ($kind === "obj") { return $stem . ".o"; }
+    if ($kind === "asm") { return $stem . ".s"; }
+    if ($kind === "zbc") { return $stem . ".zbc"; }
+    return $stem;
+}
+
 func build(string $file, $opts, $scriptDir): int {
     $o = $opts["options"];
-    $emit = $o["emit"] ?? "exe";
-    $target = $o["target"] ?? "host";
-    if ($target !== "host" && ($o["backend"] ?? "c") !== "llvm") {
-        eecho("zsc: --target " . $target . " wymaga --backend llvm (backend C: użyj --cc <cross-gcc>)");
-        return 3;
+    $kind = emit_kind($o, $opts["flags"]);
+    if (!in_array($kind, ["exe", "obj", "asm", "bc", "ll", "ir", "zbc"])) { eecho("zsc: nieznany --emit " . $kind . " (exe|obj|asm|bc|ll|ir|zbc)"); return 2; }
+    if (has_key($o, "backend") && $o["backend"] !== "llvm") {
+        eecho("zsc: jedynym backendem jest LLVM (--backend " . $o["backend"] . " nie istnieje; transpilacja do C: zst, frontend gcc: zzc)");
+        return 2;
     }
-    if (!in_array($emit, ["exe", "c", "ll", "ir", "zbc"])) { eecho("zsc: nieznany --emit " . $emit . " (exe|c|ll|ir|zbc)"); return 2; }
-    $bk = $o["backend"] ?? "c";
-    if (!in_array($bk, ["c", "llvm"])) { eecho("zsc: nieznany --backend " . $bk . " (c|llvm)"); return 2; }
     $stem = native.stem($file);
-    if ($emit === "zbc") { return build_zbc($file, $o["o"] ?? ($stem . ".zbc")); }
-    if ($emit === "ir") {
+    if ($kind === "zbc") { return build_zbc($file, $o["o"] ?? default_out($stem, "zbc")); }
+    if ($kind === "ir") {
         try { $fe = native.frontend($file, true); }
         catch (Exception $e) { eecho($e->getMessage()); return 1; }
         $res = ir.lower($fe["ast"]);
@@ -70,48 +85,53 @@ func build(string $file, $opts, $scriptDir): int {
         foreach ($res["errors"] as $e) { eecho($file . ":" . $e[0] . ": błąd [" . $e[1] . "]: " . $e[2]); }
         return count($res["errors"]) > 0 ? 1 : 0;
     }
-    $out = $o["o"] ?? $stem;
-    if ($emit === "c") {
-        try { $fe = native.frontend($file, true); }
-        catch (Exception $e) { eecho($e->getMessage()); return 1; }
-        $res = native.lower_or_report($file, $fe["ast"]);
-        if ($res === null) { return 1; }
-        $cpath = has_key($o, "o") ? $out : $stem . ".c";
-        File.write($cpath, emit_c.generate($res));
-        echo "zsc: " . $cpath;
-        return 0;
-    }
-    if ($emit === "ll") {
-        try { $fe = native.frontend($file, true); }
-        catch (Exception $e) { eecho($e->getMessage()); return 1; }
-        $res = native.lower_or_report($file, $fe["ast"]);
-        if ($res === null) { return 1; }
-        $lpath = has_key($o, "o") ? $out : $stem . ".ll";
-        File.write($lpath, emit_llvm.generate($res, $target === "host" ? "x86_64-pc-linux-gnu" : $target));
-        echo "zsc: " . $lpath;
-        return 0;
-    }
-    $rc = native.build_exe($file, $out, $opts, $scriptDir, has_key($opts["flags"], "--keep-c"));
+    $out = $o["o"] ?? default_out($stem, $kind);
+    $rc = native.compile($file, $kind, $out, $opts, $scriptDir);
     if ($rc === 0) { echo "zsc: " . $out; }
     return $rc;
 }
 
 func run(string $file, $opts, $extra, $scriptDir): int {
     $dir = System.env("TMPDIR") ?? "/tmp";
-    $tmp = $dir . "/zsc-run-" . intval(System.time() * 1000);
+    $tmp = $dir . "/zsc-run-" . System.pid() . "-" . System.nowNanos();
     Directory.create($tmp);
     $exe = $tmp . "/" . native.stem($file);
-    $rc = native.build_exe($file, $exe, $opts, $scriptDir, false);
-    if ($rc !== 0) { return $rc; }
+    $rc = native.compile($file, "exe", $exe, $opts, $scriptDir);
+    if ($rc !== 0) { llvmtool.cleanup($tmp); return $rc; }
     $status = Process.exec($exe, $extra);
-    File.delete($exe);
+    llvmtool.cleanup($tmp);
     return $status;
+}
+
+func toolchain_cmd($opts): int {
+    $tc = llvmtool.detect($opts);
+    echo "wymagany LLVM >= " . $tc["min"];
+    foreach ($tc["lines"] as $l) { echo "  " . $l; }
+    if (!$tc["ok"]) { eecho($tc["err"]); return 3; }
+    echo "host: " . llvmtool.host_triple($tc);
+    echo "cache: " . llvmtool.cache_dir();
+    return 0;
+}
+
+func runtime_cmd($opts, $scriptDir): int {
+    $tc = native.toolchain($opts);
+    if ($tc === null) { return 3; }
+    $root = native.zs_root($scriptDir);
+    if ($root === null) { eecho("zsc: nie znaleziono Z-Sharp — ustaw ZS_HOME"); return 1; }
+    $target = $opts["options"]["target"] ?? "host";
+    $triple = $target === "host" ? llvmtool.host_triple($tc) : $target;
+    $r = llvmtool.runtime_obj($tc, $root, $triple, $opts, native.opt_level($opts));
+    if (!$r["ok"]) { eecho($r["err"]); return 1; }
+    $dest = $opts["options"]["o"] ?? null;
+    if ($dest !== null) { File.write($dest, File.read($r["path"])); echo $dest; return 0; }
+    echo $r["path"];
+    return 0;
 }
 
 func main(): int {
     $argv = System.args();
     $scriptDir = System.dirname($argv[0]);
-    $r = cli.parse($argv, ["o", "target", "emit", "cc", "backend"]);
+    $r = cli.parse($argv, ["o", "target", "emit", "backend", "llvm-bin", "linker", "runtime-obj", "ldflags"]);
     $pos = $r["positional"];
     $flags = $r["flags"];
     if (has_key($flags, "--version")) { echo "zsc " . System.version; return 0; }
@@ -126,6 +146,8 @@ func main(): int {
         foreach (pipeline.stages() as $s) { echo pad_right($s["name"], 20) . pad_right($s["status"], 8) . $s["impl"]; }
         return 0;
     }
+    if ($cmd === "toolchain") { return toolchain_cmd($r); }
+    if ($cmd === "runtime") { return runtime_cmd($r, $scriptDir); }
     if (count($pos) < 2) { usage(); return 2; }
     if ($cmd === "check") { return check($pos[1], has_key($flags, "--strict"), has_key($flags, "--native")); }
     if ($cmd === "analyze") { return analyze($pos[1]); }

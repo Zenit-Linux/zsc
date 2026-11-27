@@ -1,0 +1,279 @@
+namespace llvmtool;
+
+##
+ * Toolchain LLVM dla zsc: wykrywanie narzędzi (opt, llc, clang), wymuszenie wersji >= 21,
+ * uruchamianie opt -> llc -> linker oraz cache obiektu runtime (runtime/native/zs_rt.c).
+ *
+ * zsc nie generuje C i nie woła kompilatora C dla kodu programu. Jedyny kod C to wspólny runtime
+ * (zs_rt.c); jest kompilowany raz (clang z toolchaina LLVM) i trzymany w cache albo dostarczany
+ * gotowy przez --runtime-obj / ZS_RUNTIME_OBJ.
+##
+
+func MIN_MAJOR() { return 21; }
+func MIN_MAJOR_LEGACY() { return 17; }
+
+func parse_major($text) {
+    $i = index_of($text, "version ");
+    if ($i < 0) { return 0; }
+    $j = $i + 8;
+    $n = "";
+    while ($j < strlen($text) && is_digit(substr($text, $j, 1))) { $n .= substr($text, $j, 1); $j++; }
+    return $n === "" ? 0 : intval($n);
+}
+
+func first_line($text) {
+    $p = split($text, "\n");
+    foreach ($p as $l) { if (contains($l, "version ")) { return trim($l); } }
+    return count($p) > 0 ? trim($p[0]) : "";
+}
+
+func probe($cmd) {
+    try {
+        $r = Process.run($cmd, ["--version"]);
+        if ($r["status"] !== 0) { return null; }
+        $t = $r["stdout"] . $r["stderr"];
+        return ["cmd" => $cmd, "major" => parse_major($t), "line" => first_line($t)];
+    } catch (Exception $e) {
+        return null;
+    }
+}
+
+func candidates($name, $binDir) {
+    $c = [];
+    if ($binDir !== null && $binDir !== "") {
+        $c[] = $binDir . "/" . $name . "-" . MIN_MAJOR();
+        $c[] = $binDir . "/" . $name;
+    }
+    $c[] = $name . "-" . MIN_MAJOR();
+    $c[] = $name;
+    foreach (["/usr/lib/llvm-" . MIN_MAJOR() . "/bin/", "/usr/local/llvm/bin/", "/opt/llvm/bin/", "/opt/homebrew/opt/llvm/bin/", "/usr/local/opt/llvm/bin/"] as $d) {
+        $c[] = $d . $name;
+    }
+    return $c;
+}
+
+##
+ * Szuka narzędzia LLVM o wersji >= $min. Zwraca ["ok" => true, "cmd" => ..., "major" => ...]
+ * albo ["ok" => false, "err" => komunikat].
+##
+func find_tool($name, $binDir, $min) {
+    $seen = [];
+    $best = null;
+    foreach (candidates($name, $binDir) as $c) {
+        $p = probe($c);
+        if ($p === null) { continue; }
+        $seen[] = $p["cmd"] . " (" . $p["major"] . ")";
+        if ($p["major"] >= $min) { return ["ok" => true, "cmd" => $p["cmd"], "major" => $p["major"], "line" => $p["line"]]; }
+    }
+    if (count($seen) === 0) {
+        return ["ok" => false, "err" => "zsc: nie znaleziono narzędzia LLVM '" . $name . "' (wymagany LLVM >= " . $min . "; ustaw --llvm-bin <katalog> lub ZS_LLVM_BIN)"];
+    }
+    return ["ok" => false, "err" => "zsc: '" . $name . "' ma za starą wersję: " . join($seen, ", ") . " — wymagany LLVM >= " . $min
+        . " (--allow-older-llvm / ZS_ALLOW_OLD_LLVM=1 obniża próg do " . MIN_MAJOR_LEGACY() . " bez gwarancji)"];
+}
+
+func allow_old($opts) {
+    if (has_key($opts["flags"], "--allow-older-llvm")) { return true; }
+    $e = System.env("ZS_ALLOW_OLD_LLVM");
+    return $e !== null && $e !== "" && $e !== "0";
+}
+
+func llvm_bin($opts) {
+    $b = $opts["options"]["llvm-bin"] ?? null;
+    if ($b !== null && $b !== "") { return $b; }
+    $e = System.env("ZS_LLVM_BIN");
+    if ($e !== null && $e !== "") { return $e; }
+    return null;
+}
+
+##
+ * Wykrywa komplet narzędzi. Zwraca ["ok" => bool, "opt" => cmd, "llc" => cmd, "clang" => cmd|null, "major" => int,
+ * "lines" => [...], "err" => ...].
+##
+func detect($opts) {
+    $min = allow_old($opts) ? MIN_MAJOR_LEGACY() : MIN_MAJOR();
+    $bin = llvm_bin($opts);
+    $tc = ["ok" => false, "lines" => [], "min" => $min];
+    $opt = find_tool("opt", $bin, $min);
+    if (!$opt["ok"]) { $tc["err"] = $opt["err"]; return $tc; }
+    $llc = find_tool("llc", $bin, $min);
+    if (!$llc["ok"]) { $tc["err"] = $llc["err"]; return $tc; }
+    $clang = find_tool("clang", $bin, $min);
+    $tc["opt"] = $opt["cmd"];
+    $tc["llc"] = $llc["cmd"];
+    $tc["clang"] = $clang["ok"] ? $clang["cmd"] : null;
+    $tc["major"] = $llc["major"];
+    $tc["lines"] = [$opt["cmd"] . ": " . $opt["line"], $llc["cmd"] . ": " . $llc["line"], "clang: " . ($clang["ok"] ? $clang["cmd"] . ": " . $clang["line"] : "brak")];
+    $tc["ok"] = true;
+    return $tc;
+}
+
+func host_triple($tc) {
+    $cands = [];
+    if ($tc["clang"] !== null) { $cands[] = $tc["clang"]; }
+    foreach ($cands as $c) {
+        try {
+            $r = Process.run($c, ["-dumpmachine"]);
+            if ($r["status"] === 0 && trim($r["stdout"]) !== "") { return trim($r["stdout"]); }
+        } catch (Exception $e) { }
+    }
+    try {
+        $r = Process.run($tc["llc"], ["--version"]);
+        foreach (split($r["stdout"], "\n") as $l) {
+            $t = trim($l);
+            if (starts_with($t, "Default target:")) { return trim(substr($t, 15)); }
+        }
+    } catch (Exception $e) { }
+    return "x86_64-pc-linux-gnu";
+}
+
+# ── cache i katalogi ──
+
+func mkdirs($path) {
+    if (Directory.exists($path)) { return; }
+    $parts = split($path, "/");
+    $cur = starts_with($path, "/") ? "" : ".";
+    foreach ($parts as $p) {
+        if ($p === "") { continue; }
+        $cur = $cur . "/" . $p;
+        if (!Directory.exists($cur)) { Directory.create($cur); }
+    }
+}
+
+func cache_dir() {
+    $e = System.env("ZS_CACHE");
+    if ($e !== null && $e !== "") { return $e; }
+    $x = System.env("XDG_CACHE_HOME");
+    if ($x !== null && $x !== "") { return $x . "/zsc"; }
+    $h = System.env("HOME");
+    if ($h !== null && $h !== "") { return $h . "/.cache/zsc"; }
+    return (System.env("TMPDIR") ?? "/tmp") . "/zsc-cache";
+}
+
+func tmp_dir() {
+    $base = System.env("TMPDIR") ?? "/tmp";
+    $d = $base . "/zsc-" . System.pid() . "-" . System.nowNanos();
+    mkdirs($d);
+    return $d;
+}
+
+func sanitize($s) {
+    $o = "";
+    foreach (chars($s) as $c) { $o .= (is_alnum($c) || $c === "." || $c === "-") ? $c : "_"; }
+    return $o;
+}
+
+func opt_pass($level) {
+    if ($level === "-O0") { return "default<O0>"; }
+    if ($level === "-O1") { return "default<O1>"; }
+    if ($level === "-O3") { return "default<O3>"; }
+    if ($level === "-Os") { return "default<Os>"; }
+    if ($level === "-Oz") { return "default<Oz>"; }
+    return "default<O2>";
+}
+
+func llc_level($level) {
+    if ($level === "-O0") { return "-O0"; }
+    if ($level === "-O1") { return "-O1"; }
+    if ($level === "-O3") { return "-O3"; }
+    return "-O2";
+}
+
+func run_tool($cmd, $args, $what) {
+    try { $r = Process.run($cmd, $args); }
+    catch (Exception $e) { return ["ok" => false, "err" => "zsc: nie można uruchomić " . $what . " (" . $cmd . "): " . $e->getMessage()]; }
+    if ($r["status"] !== 0) {
+        return ["ok" => false, "err" => trim($r["stderr"] . $r["stdout"]) . "\nzsc: " . $what . " zakończył się kodem " . $r["status"]];
+    }
+    return ["ok" => true, "stdout" => $r["stdout"], "stderr" => $r["stderr"]];
+}
+
+##
+ * .ll -> (opt) -> .bc
+##
+func optimize($tc, $ll, $bc, $level, $triple) {
+    $a = ["-passes=" . opt_pass($level), $ll, "-o", $bc];
+    return run_tool($tc["opt"], $a, "opt");
+}
+
+##
+ * .bc/.ll -> .o | .s
+##
+func codegen($tc, $in, $out, $level, $triple, $kind, $triple_explicit) {
+    $a = [llc_level($level), "-filetype=" . $kind, "-relocation-model=pic"];
+    if ($triple_explicit) { $a[] = "-mtriple=" . $triple; }
+    $a[] = $in;
+    $a[] = "-o";
+    $a[] = $out;
+    return run_tool($tc["llc"], $a, "llc");
+}
+
+##
+ * Obiekt runtime: --runtime-obj / ZS_RUNTIME_OBJ albo kompilacja zs_rt.c (clang z toolchaina) do cache.
+##
+func runtime_obj($tc, $root, $triple, $opts, $level) {
+    $given = $opts["options"]["runtime-obj"] ?? System.env("ZS_RUNTIME_OBJ");
+    if ($given !== null && $given !== "") {
+        if (!File.exists($given)) { return ["ok" => false, "err" => "zsc: brak obiektu runtime " . $given]; }
+        return ["ok" => true, "path" => $given];
+    }
+    $src = $root . "/runtime/native/zs_rt.c";
+    $hdr = $root . "/runtime/include/zs_native.h";
+    if (!File.exists($src) || !File.exists($hdr)) {
+        return ["ok" => false, "err" => "zsc: nie znaleziono runtime (" . $src . ") — ustaw ZS_HOME albo --runtime-obj"];
+    }
+    $ss = File.stat($src);
+    $hs = File.stat($hdr);
+    $cc = $tc["clang"];
+    if ($cc === null) {
+        return ["ok" => false, "err" => "zsc: do zbudowania runtime potrzebny jest clang >= " . $tc["min"] . " (albo gotowy obiekt: --runtime-obj)"];
+    }
+    $lv = ($level === "-O0") ? "-O0" : "-O2";
+    $key = "rt-" . $ss["size"] . "-" . $ss["mtime"] . "-" . $hs["size"] . "-" . $hs["mtime"] . "-" . sanitize($triple) . "-" . $lv . "-llvm" . $tc["major"] . ".o";
+    $dir = cache_dir();
+    $obj = $dir . "/" . $key;
+    if (File.exists($obj)) { return ["ok" => true, "path" => $obj]; }
+    try { mkdirs($dir); } catch (Exception $e) { }
+    $tmp = $obj . "." . System.pid() . ".tmp";
+    $dest = Directory.exists($dir) ? $tmp : (tmp_dir() . "/zs_rt.o");
+    $args = ["-c", $src, "-o", $dest, $lv, "-std=gnu11", "-w", "-fPIC", "-I", $root . "/runtime/include", "--target=" . $triple];
+    $r = run_tool($cc, $args, "clang (runtime)");
+    if (!$r["ok"]) { return $r; }
+    if ($dest === $tmp) { File.rename($tmp, $obj); return ["ok" => true, "path" => $obj]; }
+    return ["ok" => true, "path" => $dest];
+}
+
+##
+ * Linkowanie: obiekt programu + obiekt runtime -> plik wykonywalny. Sterownik: --linker / ZS_LINKER,
+ * w przeciwnym razie clang z toolchaina, a gdy nie linkuje — cc.
+##
+func link($tc, $objs, $out, $triple, $triple_explicit, $opts) {
+    $drivers = [];
+    $l = $opts["options"]["linker"] ?? System.env("ZS_LINKER");
+    if ($l !== null && $l !== "") { $drivers[] = $l; }
+    if ($tc["clang"] !== null) { $drivers[] = $tc["clang"]; }
+    foreach (["cc", "gcc"] as $c) { $drivers[] = $c; }
+    $last = "";
+    foreach ($drivers as $d) {
+        $a = [];
+        foreach ($objs as $o) { $a[] = $o; }
+        $a[] = "-o";
+        $a[] = $out;
+        $a[] = "-lm";
+        if ($triple_explicit && $d === $tc["clang"]) { $a[] = "--target=" . $triple; }
+        $extra = $opts["options"]["ldflags"] ?? null;
+        if ($extra !== null && $extra !== "") { foreach (split($extra, " ") as $x) { if ($x !== "") { $a[] = $x; } } }
+        try { $r = Process.run($d, $a); }
+        catch (Exception $e) { $last = $e->getMessage(); continue; }
+        if ($r["status"] === 0) { return ["ok" => true, "driver" => $d]; }
+        $last = trim($r["stderr"]);
+    }
+    return ["ok" => false, "err" => $last . "\nzsc: linkowanie nie powiodło się (sterownik: --linker / ZS_LINKER)"];
+}
+
+func cleanup($dir) {
+    try {
+        foreach (Directory.list($dir) as $f) { File.delete($dir . "/" . $f); }
+        Directory.remove($dir);
+    } catch (Exception $e) { }
+}

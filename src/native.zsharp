@@ -4,11 +4,11 @@ import Workspace.parser;
 import Workspace.sema;
 import Workspace.ir;
 import Workspace.link;
-import Workspace.emit_c;
 import Workspace.emit_llvm;
+import llvmtool;
 
 ##
- * Sterownik natywnego backendu zsc: źródło -> AST -> sema -> IR -> C -> (cc + libzs_runtime.a) -> binarka.
+ * Sterownik natywnego backendu zsc: źródło -> AST -> sema -> IR -> LLVM IR -> opt -> llc -> linker (+ runtime) -> binarka.
 ##
 
 func basename($p) {
@@ -31,18 +31,14 @@ func stem($p) {
 func zs_root($scriptDir) {
     $env = System.env("ZS_HOME");
     if ($env !== null && $env !== "") { return $env; }
+    $d = $scriptDir;
+    if (!starts_with($d, "/")) { $d = (System.env("PWD") ?? ".") . "/" . $d; }
+    foreach ([$d . "/../share/z-sharp", $d . "/share/z-sharp"] as $c) {
+        if (File.exists($c . "/runtime/native/zs_rt.c")) { return $c; }
+    }
     $f = System.resolveImport(["Workspace", "cli"], $scriptDir);
     if ($f === null) { return null; }
     return System.dirname(System.dirname($f));
-}
-
-func runtime_lib($root) {
-    $env = System.env("ZS_RUNTIME_LIB");
-    if ($env !== null && $env !== "") { return $env; }
-    foreach (["target/release/libzs_runtime.a", "target/debug/libzs_runtime.a", "lib/libzs_runtime.a"] as $rel) {
-        if (File.exists($root . "/" . $rel)) { return $root . "/" . $rel; }
-    }
-    return null;
 }
 
 ##
@@ -82,68 +78,78 @@ func lower_or_report($file, $ast) {
     return null;
 }
 
-func find_cc($opts) {
-    $cands = [];
-    if (($opts["options"]["cc"] ?? null) !== null) { $cands[] = $opts["options"]["cc"]; }
-    $env = System.env("ZS_CC");
-    if ($env !== null && $env !== "") { $cands[] = $env; }
-    foreach (["cc", "gcc", "clang"] as $c) { $cands[] = $c; }
-    foreach ($cands as $c) {
-        try { $r = Process.run($c, ["--version"]); if ($r["status"] === 0) { return $c; } }
-        catch (Exception $e) { }
-    }
-    return null;
-}
-
-func find_llvm_cc($opts) {
-    $c = $opts["options"]["cc"] ?? System.env("ZS_CC");
-    $cands = [];
-    if ($c !== null && $c !== "") { $cands[] = $c; }
-    foreach (["clang", "clang-18", "clang-17", "clang-16", "clang-19", "clang-20"] as $x) { $cands[] = $x; }
-    foreach ($cands as $x) {
-        try { $r = Process.run($x, ["--version"]); if ($r["status"] === 0 && contains($r["stdout"], "clang")) { return $x; } }
-        catch (Exception $e) { }
-    }
-    return null;
-}
-
 func opt_level($opts) {
-    foreach (["-O0", "-O1", "-O2", "-O3", "-Os"] as $o) { if (has_key($opts["flags"], $o)) { return $o; } }
+    foreach (["-O0", "-O1", "-O2", "-O3", "-Os", "-Oz"] as $o) { if (has_key($opts["flags"], $o)) { return $o; } }
     return "-O2";
 }
 
 ##
- * Buduje binarkę natywną. Zwraca 0 albo kod błędu (komunikaty na stderr).
+ * Toolchain LLVM (wersja >= 21). Zwraca tablicę z detect() albo null (komunikat już wypisany).
 ##
-func build_exe($file, $out, $opts, $scriptDir, $keepC) {
+func toolchain($opts) {
+    $tc = llvmtool.detect($opts);
+    if (!$tc["ok"]) { eecho($tc["err"]); return null; }
+    return $tc;
+}
+
+##
+ * Etapy backendu: frontend -> IR -> .ll. Zwraca ["ll" => tekst, "triple" => ..., "explicit" => bool] albo null.
+##
+func make_ll($file, $opts, $tc) {
     try { $fe = frontend($file, true); }
-    catch (Exception $e) { eecho($e->getMessage()); return 1; }
+    catch (Exception $e) { eecho($e->getMessage()); return null; }
     print_warnings($file, $fe["warnings"]);
     $irr = lower_or_report($file, $fe["ast"]);
-    if ($irr === null) { return 1; }
+    if ($irr === null) { return null; }
+    $target = $opts["options"]["target"] ?? "host";
+    $explicit = $target !== "host";
+    $triple = $explicit ? $target : llvmtool.host_triple($tc);
+    try { $ll = emit_llvm.generate($irr, $triple); }
+    catch (Exception $e) { eecho("zsc: błąd wewnętrzny backendu LLVM: " . $e->getMessage()); return null; }
+    return ["ll" => $ll, "triple" => $triple, "explicit" => $explicit];
+}
+
+##
+ * Kompilacja do wskazanego rodzaju wyjścia: ll | bc | asm | obj | exe. Zwraca 0 albo kod błędu.
+##
+func compile($file, $kind, $out, $opts, $scriptDir) {
+    $tc = toolchain($opts);
+    if ($tc === null) { return 3; }
+    $m = make_ll($file, $opts, $tc);
+    if ($m === null) { return 1; }
+    if ($kind === "ll") { File.write($out, $m["ll"]); return 0; }
+    $level = opt_level($opts);
+    $tmp = llvmtool.tmp_dir();
+    $keep = has_key($opts["flags"], "--keep-temps");
+    $ll = $tmp . "/prog.ll";
+    $bc = $tmp . "/prog.bc";
+    File.write($ll, $m["ll"]);
+    $bcOut = $kind === "bc" ? $out : $bc;
+    $r = llvmtool.optimize($tc, $ll, $bcOut, $level, $m["triple"]);
+    if (!$r["ok"]) {
+        eecho($r["err"]);
+        eecho("zsc: błąd wewnętrzny: wygenerowany LLVM IR nie przeszedł opt (zachowano " . $tmp . ")");
+        return 1;
+    }
+    if ($kind === "bc") { if (!$keep) { llvmtool.cleanup($tmp); } return 0; }
+    $ft = $kind === "asm" ? "asm" : "obj";
+    $o1 = ($kind === "asm" || $kind === "obj") ? $out : $tmp . "/prog.o";
+    $r = llvmtool.codegen($tc, $bc, $o1, $level, $m["triple"], $ft, $m["explicit"]);
+    if (!$r["ok"]) { eecho($r["err"]); return 1; }
+    if ($kind === "asm" || $kind === "obj") {
+        if (!$keep) { llvmtool.cleanup($tmp); }
+        return 0;
+    }
     $root = zs_root($scriptDir);
-    if ($root === null || !File.exists($root . "/runtime/include/zs_native.h")) {
-        eecho("zsc: nie znaleziono Z-Sharp (runtime/include/zs_native.h) — ustaw ZS_HOME");
-        return 1;
-    }
-    $rt = $root . "/runtime/native/zs_rt.c";
-    if (!File.exists($rt)) { eecho("zsc: brak " . $rt . " — niekompletny Z-Sharp (ustaw ZS_HOME)"); return 1; }
-    $cc = find_cc($opts);
-    if ($cc === null) { eecho("zsc: nie znaleziono kompilatora C (cc/gcc/clang) — zainstaluj lub ustaw ZS_CC / --cc"); return 1; }
-    $backend = $opts["options"]["backend"] ?? "c";
-    try { $csrc = $backend === "llvm" ? emit_llvm.generate($irr, (($opts["options"]["target"] ?? "host") === "host" ? "x86_64-pc-linux-gnu" : $opts["options"]["target"])) : emit_c.generate($irr); }
-    catch (Exception $e) { eecho("zsc: błąd wewnętrzny backendu: " . $e->getMessage()); return 1; }
-    $cfile = $out . ($backend === "llvm" ? ".ll" : ".c");
-    File.write($cfile, $csrc);
-    $args = [$cfile, "-o", $out, opt_level($opts), "-std=gnu11", "-w", "-I", $root . "/runtime/include", $rt, "-lm"];
-    if ($backend === "llvm" && has_key($opts["options"], "target") && $opts["options"]["target"] !== "host") { $args[] = "--target=" . $opts["options"]["target"]; }
-    if ($backend === "llvm") { $cc = find_llvm_cc($opts); if ($cc === null) { eecho("zsc: backend LLVM wymaga clang (zainstaluj lub ustaw ZS_CC / --cc)"); return 1; } }
-    $r = Process.run($cc, $args);
-    if (!$keepC && $r["status"] === 0) { File.delete($cfile); }
-    if ($r["status"] !== 0) {
-        eecho($r["stderr"]);
-        eecho("zsc: błąd wewnętrzny: wygenerowany kod C nie kompiluje się (zachowano " . $cfile . ")");
-        return 1;
-    }
+    if ($root === null) { eecho("zsc: nie znaleziono Z-Sharp — ustaw ZS_HOME"); return 1; }
+    $rt = llvmtool.runtime_obj($tc, $root, $m["triple"], $opts, $level);
+    if (!$rt["ok"]) { eecho($rt["err"]); return 1; }
+    $r = llvmtool.link($tc, [$o1, $rt["path"]], $out, $m["triple"], $m["explicit"], $opts);
+    if (!$r["ok"]) { eecho($r["err"]); return 1; }
+    if (!$keep) { llvmtool.cleanup($tmp); }
     return 0;
+}
+
+func build_exe($file, $out, $opts, $scriptDir) {
+    return compile($file, "exe", $out, $opts, $scriptDir);
 }

@@ -1,0 +1,31 @@
+#!/bin/bash
+# Testy zsc (backend LLVM >= 21). Wymaga: zsc w PATH lub ZSC, LLVM >= 21 (ZS_LLVM_BIN), Z-Sharp obok (../Z-Sharp).
+HERE=$(cd "$(dirname "$0")" && pwd); ZS=${ZS_HOME:-$HERE/../Z-Sharp}; export ZS_HOME=$ZS
+ZSC=$(command -v ${ZSC:-zsc}); T=$(mktemp -d); trap 'rm -rf "$T"' EXIT; fail=0
+ok() { echo "ok   $1"; }; bad() { echo "FAIL $1"; fail=1; }
+cat > $T/h.zs <<'Z'
+function f($n) { return $n < 2 ? $n : f($n - 1) + f($n - 2); }
+echo "fib", f(15);
+Z
+# 1. toolchain
+$ZSC toolchain >/dev/null && ok toolchain || bad toolchain
+# 2. emisje: ll, bc, obj, asm, exe, run
+for k in ll bc obj asm; do $ZSC build $T/h.zs --emit $k -o $T/h.$k >/dev/null 2>&1 && [ -s $T/h.$k ] && ok "emit $k" || bad "emit $k"; done
+head -c 4 $T/h.bc | grep -q BC && ok "bc magic" || bad "bc magic"
+grep -q "define" $T/h.ll && ok "ll zawiera IR" || bad "ll zawiera IR"
+$ZSC build $T/h.zs -o $T/h >/dev/null 2>&1 && [ "$($T/h)" = "fib 610" ] && ok exe || bad exe
+[ "$($ZSC run $T/h.zs 2>/dev/null)" = "fib 610" ] && ok run || bad run
+for o in -O0 -O1 -O2 -O3 -Os -Oz; do $ZSC build $T/h.zs -o $T/h_o $o >/dev/null 2>&1 && [ "$($T/h_o)" = "fib 610" ] && ok "opt $o" || bad "opt $o"; done
+# 3. kod wyjścia programu przechodzi przez run
+echo 'exit(7);' > $T/e.zs; $ZSC run $T/e.zs >/dev/null 2>&1; [ $? = 7 ] && ok "run exit code" || bad "run exit code"
+# 4. brak C: --backend c odrzucony (kod 2)
+$ZSC build $T/h.zs --backend c -o $T/x >/dev/null 2>&1; [ $? = 2 ] && ok "backend c odrzucony" || bad "backend c odrzucony"
+# 5. za stary LLVM: atrapa llc/opt z wersją 18 => kod 3, czytelny komunikat
+mkdir $T/fake; for t in opt llc clang; do printf '#!/bin/sh\necho "LLVM version 18.1.0"\n' > $T/fake/$t; chmod +x $T/fake/$t; done
+out=$(env ZS_LLVM_BIN=$T/fake PATH=$T/fake:/nonexistent $ZSC build $T/h.zs -o $T/y 2>&1); rc=$?
+[ $rc = 3 ] && echo "$out" | grep -q "za starą wersję" && ok "odmowa dla LLVM 18" || bad "odmowa dla LLVM 18 (rc=$rc)"
+# 6. błąd kompilacji => 1
+echo 'function ((' > $T/b.zs; $ZSC build $T/b.zs -o $T/z >/dev/null 2>&1; [ $? = 1 ] && ok "błąd składni => 1" || bad "błąd składni => 1"
+# 7. konformancja
+"$ZS/tests/run_conformance.sh" zsc | tail -1 | grep -q " 0 błędów" && ok conformance || bad conformance
+exit $fail

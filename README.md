@@ -1,31 +1,25 @@
-# zsc — kompilator AOT Z# (0.0.1)
+# zsc — kompilator Z# (backend LLVM >= 21)
 
-`zsc` jest napisany w Z# i korzysta z rdzenia `Z-Sharp` (lexer, parser, sema, IR, backendy C i LLVM).
+`zsc` to niezależny backend: **Z# → AST → sema → IR → LLVM IR → `opt` → `llc` → linker**. Nie transpiluje do C i nie woła kompilatora C dla
+kodu programu. Jedyny kod C na drodze to wspólny runtime (`Z-Sharp/runtime/native/zs_rt.c`), kompilowany raz do cache
+(`~/.cache/zsc`) lub dostarczany gotowy (`--runtime-obj`).
 
 ```
-zsc build prog.zs                  # binarka natywna: AST → sema → IR → C → cc + runtime/native/zs_rt.c
-zsc build prog.zs --backend llvm   # AST → sema → IR → LLVM IR → clang (+ --target <triple>, --emit ll)
-zsc build prog.zs -o app -O3       # nazwa i poziom optymalizacji
-zsc build prog.zs --emit c         # tylko kod C   (--emit ir | zbc | exe)
-zsc run prog.zs -- arg1 arg2       # zbuduj i uruchom (kod wyjścia programu = kod wyjścia zsc)
+zsc build prog.zs                    # plik wykonywalny ./prog
+zsc build prog.zs --emit ll|bc|asm|obj|ir|zbc -o wyjście
+zsc build prog.zs -O3 --target aarch64-linux-gnu   # (skrośnie: niezweryfikowane)
+zsc run prog.zs -- argumenty         # zbuduj i uruchom; kod wyjścia programu = kod wyjścia zsc
 zsc check [--strict] [--native] prog.zs
-zsc analyze prog.zs                # analiza ucieczki: klasy pamięci ZAMM
-zsc stages | --tokens | --version
+zsc analyze prog.zs                  # klasy pamięci ZAMM
+zsc toolchain                        # wykryte opt/llc/clang i ich wersje
+zsc runtime [-o zs_rt.o]             # zbuduj obiekt runtime
 ```
 
-Kody wyjścia: `0` ok, `1` błąd (składnia, konstrukcja spoza podzbioru, brak toolchaina), `2` użycie, `3` cel niedostępny (`--target` ≠ `host` bez `--backend llvm`).
-Zmienne: `ZS_HOME` (katalog Z-Sharp), `ZS_CC` / `--cc` (kompilator C; dla LLVM: clang).
+Wymagania: **LLVM >= 21** (`opt`, `llc`, `clang` jako sterownik linkera). Wyszukiwanie: `--llvm-bin`, `ZS_LLVM_BIN`, `opt-21`/`opt` w `PATH`,
+`/usr/lib/llvm-21/bin`. Za stara wersja → kod wyjścia 3 i komunikat; `--allow-older-llvm` (lub `ZS_ALLOW_OLD_LLVM=1`) obniża próg do 17 bez gwarancji.
 
-## Wymagania
-Zbudowany rdzeń (`cd Z-Sharp && cargo build --release`) oraz kompilator C (`cc`/`gcc`/`clang`; backend LLVM wymaga `clang`). Repo `Z-Sharp` dołącz jako submoduł `Z-Sharp/`.
-Uruchamianie samego `zsc`: `Z-Sharp/target/release/zsc0 run src/main.zsharp <polecenie>` (albo jako `.zbc`: `zsc0 exec zsc.zbc <polecenie>`).
+Opcje toolchaina: `--linker <sterownik>` (`ZS_LINKER`), `--runtime-obj <plik.o>` (`ZS_RUNTIME_OBJ`), `--ldflags "..."`, `--keep-temps`.
+Kody wyjścia: 0 ok · 1 błąd (składnia, konstrukcja spoza podzbioru natywnego, błąd narzędzia) · 2 użycie · 3 brak/za stary LLVM.
 
-## Podzbiór języka w backendzie natywnym
-Obsługiwane: funkcje (domyślne parametry, rekurencja, kontrakty typów int/float/string/bool/array), `int`/`float`/`bool`/`null`/napisy, tablice indeksowane i asocjacyjne
-(klucze int/string, semantyka wartości, `$a[] = x`, zagnieżdżone, `keys/values/has_key`), `if/elseif/else`, `while`, `do-while`, `for`, `foreach`, `switch`, `try/catch/finally/throw` (`Exception`, `Error`, `Throwable`, `getMessage`), `break/continue N`, `??`, `?:`,
-operatory arytmetyczne i porównania, `echo/necho/eecho/exit`, wbudowane (`count`, `strlen`, `substr`, `trim`, `join`, `range`, `in_array`, `Math.*`, …).
-Poza podzbiorem (błąd `E0101…E0107` z linią): klasy i własne klasy wyjątków, domknięcia, importy modułów Z#, argumenty nazwane/variadic, operatory bitowe. Wyszukiwanie klucza w tablicach asocjacyjnych jest liniowe (O(n)).
-Semantyka (stdout, stderr, kod wyjścia, komunikaty błędów, numery linii) jest sprawdzana testami różnicowymi względem interpretera dla obu backendów: `tests/native/run_diff.sh` (12/12).
-
-## Ograniczenia
-Pamięć natywna: czas życia `Persistent` (bez zwalniania do końca procesu); obniżanie do ramek ZAMM wg analizy ucieczki — do zrobienia. SSA, domknięcia, named args, statyczne pola i `extern` — do zrobienia. Klasy, wyjątki-klasy, moduły (`import`), wariadyki i operatory bitowe działają natywnie; `zsc` kompiluje samego siebie natywnie (`Z-Sharp/scripts/stage3.sh`).
+Bootstrap i zależności: `Z-Sharp/docs/BOOTSTRAP.md`. Testy: `tests/run.sh`.
+Stan zweryfikowany: Linux x86-64, LLVM 21.1.8. Inne platformy i kompilacja skrośna — niesprawdzone.
